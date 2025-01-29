@@ -445,9 +445,11 @@ class GRPOTrainer(Trainer):
         else:
             # Regular generation path
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+                unwrapped_model.eval()  # Needed to make sure use_cache works with gradient_checkpointing
                 prompt_completion_ids = unwrapped_model.generate(
                     prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
                 )
+            self.model.train()
 
             # Compute prompt length and extract completion ids
             prompt_length = prompt_ids.size(1)
