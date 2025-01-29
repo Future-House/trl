@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 import textwrap
 import warnings
@@ -54,6 +55,9 @@ if is_vllm_available():
 
 if is_wandb_available():
     import wandb
+
+
+logger = logging.getLogger(__name__)
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -383,6 +387,7 @@ class GRPOTrainer(Trainer):
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -self.max_prompt_length :]
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -self.max_prompt_length :]
 
+        logger.debug("Starting generation")
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
             # First, have main process load weights if needed
@@ -442,9 +447,11 @@ class GRPOTrainer(Trainer):
                 per_token_logps.append(token_log_prob)
             return torch.stack(per_token_logps)
 
+        logger.debug("Calculating policy logprobs")
         num_logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         per_token_logps = get_per_token_logps(model, prompt_completion_ids, num_logits_to_keep)
 
+        logger.debug("Calculating reference logprobs")
         with torch.inference_mode():
             if self.ref_model is not None:
                 ref_per_token_logps = get_per_token_logps(self.ref_model, prompt_completion_ids, num_logits_to_keep)
