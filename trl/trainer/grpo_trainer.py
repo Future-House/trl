@@ -435,6 +435,14 @@ class GRPOTrainer(Trainer):
         prompt_length = prompt_inputs["input_ids"].size(1)
         prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]
 
+        # Prepare reward kwargs before looping through microbatches
+        if any(not isinstance(reward_func, PreTrainedModel) for reward_func in self.reward_funcs):
+            # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+            all_reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
+            for key in all_reward_kwargs:
+                for example in inputs:
+                    all_reward_kwargs[key].extend([example[key]] * self.num_generations)
+
         # iterate through bsz in loss_bsz chunks and accumulate:
         # - rewards
         # - per-token log probabilities
@@ -443,9 +451,9 @@ class GRPOTrainer(Trainer):
         all_per_token_logps = []
         all_per_token_kl = []
         for i in range(0, bsz, loss_bsz):
-            current_batch_idcs = slice(i, i + loss_bsz)
+            current_batch_span = slice(i, i + loss_bsz)
 
-            completion_ids = prompt_completion_ids[current_batch_idcs, prompt_length:]
+            completion_ids = prompt_completion_ids[current_batch_span, prompt_length:]
             current_bsz = completion_ids.size(0)
 
             # Get the per-token log probabilities for the completions for the model and the reference model
@@ -492,17 +500,16 @@ class GRPOTrainer(Trainer):
                 completions = [[{"role": "assistant", "content": completion}] for completion in completions]
 
             # Compute the rewards
-
             rewards_per_func = torch.zeros(current_bsz, len(self.reward_funcs), device=device)
             for i, (reward_func, reward_processing_class) in enumerate(
                 zip(self.reward_funcs, self.reward_processing_classes)
             ):
                 if isinstance(reward_func, PreTrainedModel):
                     if is_conversational(inputs[0]):
-                        messages = [{"messages": p + c} for p, c in zip(prompts[current_batch_idcs], completions)]
+                        messages = [{"messages": p + c} for p, c in zip(prompts[current_batch_span], completions)]
                         texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                     else:
-                        texts = [p + c for p, c in zip(prompts[current_batch_idcs], completions)]
+                        texts = [p + c for p, c in zip(prompts[current_batch_span], completions)]
                     reward_inputs = reward_processing_class(
                         texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                     )
@@ -510,14 +517,9 @@ class GRPOTrainer(Trainer):
                     with torch.inference_mode():
                         rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
                 else:
-                    # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                    reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
-                    for key in reward_kwargs:
-                        for example in inputs:
-                            # Repeat each value in the column for `num_generations` times
-                            reward_kwargs[key].extend([example[key]] * self.num_generations)
+                    reward_kwargs = {k: v[current_batch_span] for k, v in all_reward_kwargs.items()}
                     output_reward_func = reward_func(
-                        prompts=prompts[current_batch_idcs], completions=completions, **reward_kwargs
+                        prompts=prompts[current_batch_span], completions=completions, **reward_kwargs
                     )
                     rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
