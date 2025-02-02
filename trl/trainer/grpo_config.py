@@ -174,3 +174,12 @@ class GRPOConfig(TrainingArguments):
         default=0.04,
         metadata={"help": "KL coefficient."},
     )
+
+    per_device_micro_batch_size: int = field(
+        default=8,
+        metadata={
+            "help": "Micro batch size per GPU/TPU/MPS/NPU core/CPU for computing loss terms. "
+            "These microbatches will be accumulated over, resulting in the same effective "
+            "batch size as `per_device_train_batch_size*num_generations`, but with lower mem footprint."
+        },
+    )
