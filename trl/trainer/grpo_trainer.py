@@ -287,7 +287,7 @@ class GRPOTrainer(Trainer):
                     "`pip install vllm` to use it."
                 )
 
-            if self.accelerator.is_main_process:
+            if self.accelerator.is_local_main_process:
                 vllm_device = self.args.vllm_device
                 if vllm_device == "auto":
                     vllm_device = f"cuda:{self.accelerator.num_processes}"  # take the next GPU idx
@@ -393,27 +393,27 @@ class GRPOTrainer(Trainer):
             if self.state.global_step != self._last_loaded_step:
                 with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
                     state_dict = unwrapped_model.state_dict()
-                if self.accelerator.is_main_process:
+                if self.accelerator.is_local_main_process:
                     llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                     llm_model.load_weights(state_dict.items())
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
-            all_prompts_text = gather_object(prompts_text)
-            if self.accelerator.is_main_process:
-                outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+            local_prompts_text = gather_object(prompts_text, group=self.accelerator.local_process_group)
+            if self.accelerator.is_local_main_process:
+                outputs = self.llm.generate(local_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
+                local_completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
             else:
-                completion_ids = [None] * len(all_prompts_text) * self.num_generations
+                local_completion_ids = [None] * (len(local_prompts_text) * self.num_generations)
 
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
-            completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            local_completion_ids = broadcast_object_list(local_completion_ids, from_process=0, group=self.accelerator.local_process_group)
             process_slice = slice(
                 self.accelerator.process_index * len(prompts) * self.num_generations,
                 (self.accelerator.process_index + 1) * len(prompts) * self.num_generations,
             )
-            completion_ids = completion_ids[process_slice]
+            completion_ids = local_completion_ids[process_slice]
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
