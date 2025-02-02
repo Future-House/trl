@@ -403,24 +403,24 @@ class GRPOTrainer(Trainer):
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
                 outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                micro_completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
             else:
-                completion_ids = [None] * len(all_prompts_text) * self.num_generations
+                micro_completion_ids = [None] * len(all_prompts_text) * self.num_generations
 
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
-            completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            micro_completion_ids = broadcast_object_list(micro_completion_ids, from_process=0)
             process_slice = slice(
                 self.accelerator.process_index * len(prompts) * self.num_generations,
                 (self.accelerator.process_index + 1) * len(prompts) * self.num_generations,
             )
-            completion_ids = completion_ids[process_slice]
+            micro_completion_ids = micro_completion_ids[process_slice]
 
             # Pad the completions, and concatenate them with the prompts
-            completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
-            completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
+            micro_completion_ids = [torch.tensor(ids, device=device) for ids in micro_completion_ids]
+            micro_completion_ids = pad(micro_completion_ids, padding_value=self.processing_class.pad_token_id)
             prompt_inputs_repeated = torch.repeat_interleave(prompt_inputs["input_ids"], self.num_generations, dim=0)
-            prompt_completion_ids = torch.cat([prompt_inputs_repeated, completion_ids], dim=1)
+            prompt_completion_ids = torch.cat([prompt_inputs_repeated, micro_completion_ids], dim=1)
         else:
             # Regular generation path
             with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
@@ -431,7 +431,7 @@ class GRPOTrainer(Trainer):
             model.train()
         logger.info("Finished generation")
 
-        bsz = prompt_inputs["input_ids"].size(0)
+        bsz = prompt_completion_ids.size(0)
         micro_bsz = self.args.per_device_micro_batch_size or bsz  # default to full batch if not set
         prompt_length = prompt_inputs["input_ids"].size(1)
         prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]
@@ -448,14 +448,17 @@ class GRPOTrainer(Trainer):
         # - rewards
         # - per-token log probabilities
         # - per-token KL divergences
+        # - masks of completion tokens
         all_rewards_per_func = []
         all_per_token_logps = []
         all_per_token_kl = []
+        all_completion_mask = []
         for i in range(0, bsz, micro_bsz):
             current_batch_span = slice(i, i + micro_bsz)
 
-            completion_ids = prompt_completion_ids[current_batch_span, prompt_length:]
-            current_bsz = completion_ids.size(0)
+            micro_prompt_completion_ids = prompt_completion_ids[current_batch_span]
+            micro_completion_ids = micro_prompt_completion_ids[:, prompt_length:]
+            current_bsz = micro_completion_ids.size(0)  # last one may be <micro_bsz
 
             # Get the per-token log probabilities for the completions for the model and the reference model
             def get_per_token_logps(model, input_ids, logits_to_keep):
@@ -473,15 +476,18 @@ class GRPOTrainer(Trainer):
                     per_token_logps.append(token_log_prob)
                 return torch.stack(per_token_logps)
 
-            logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
-            per_token_logps = get_per_token_logps(model, prompt_completion_ids, logits_to_keep)
+            # we only need to compute the logits for the completion tokens
+            logits_to_keep = micro_completion_ids.size(1)
+            per_token_logps = get_per_token_logps(model, micro_prompt_completion_ids, logits_to_keep)
 
             with torch.inference_mode():
                 if self.ref_model is not None:
-                    ref_per_token_logps = get_per_token_logps(self.ref_model, prompt_completion_ids, logits_to_keep)
+                    ref_per_token_logps = get_per_token_logps(
+                        self.ref_model, micro_prompt_completion_ids, logits_to_keep
+                    )
                 else:
                     with self.accelerator.unwrap_model(model).disable_adapter():
-                        ref_per_token_logps = get_per_token_logps(model, prompt_completion_ids, logits_to_keep)
+                        ref_per_token_logps = get_per_token_logps(model, micro_prompt_completion_ids, logits_to_keep)
 
             # Compute the KL divergence between the model and the reference model
             per_token_kl = (
@@ -489,14 +495,14 @@ class GRPOTrainer(Trainer):
             )
 
             # Mask everything after the first EOS token
-            is_eos = completion_ids == self.processing_class.eos_token_id
+            is_eos = micro_completion_ids == self.processing_class.eos_token_id
             eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
             eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
             sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
             completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
             # Decode the generated completions
-            completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+            completions = self.processing_class.batch_decode(micro_completion_ids, skip_special_tokens=True)
             if is_conversational(inputs[0]):
                 completions = [[{"role": "assistant", "content": completion}] for completion in completions]
 
@@ -527,11 +533,13 @@ class GRPOTrainer(Trainer):
             all_rewards_per_func.append(rewards_per_func)
             all_per_token_logps.append(per_token_logps)
             all_per_token_kl.append(per_token_kl)
+            all_completion_mask.append(completion_mask)
 
         # Concatenate and compute the loss
         rewards_per_func = torch.concatenate(all_rewards_per_func, dim=0)
         per_token_logps = torch.concatenate(all_per_token_logps, dim=0)
         per_token_kl = torch.concatenate(all_per_token_kl, dim=0)
+        completion_mask = torch.concatenate(all_completion_mask, dim=0)
 
         # Sum the rewards from all reward functions
         rewards = rewards_per_func.sum(dim=1)
