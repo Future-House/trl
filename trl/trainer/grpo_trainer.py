@@ -403,24 +403,24 @@ class GRPOTrainer(Trainer):
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
                 outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
-                micro_completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
             else:
-                micro_completion_ids = [None] * len(all_prompts_text) * self.num_generations
+                completion_ids = [None] * len(all_prompts_text) * self.num_generations
 
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
             # corresponding slice.
-            micro_completion_ids = broadcast_object_list(micro_completion_ids, from_process=0)
+            completion_ids = broadcast_object_list(completion_ids, from_process=0)
             process_slice = slice(
                 self.accelerator.process_index * len(prompts) * self.num_generations,
                 (self.accelerator.process_index + 1) * len(prompts) * self.num_generations,
             )
-            micro_completion_ids = micro_completion_ids[process_slice]
+            completion_ids = completion_ids[process_slice]
 
             # Pad the completions, and concatenate them with the prompts
-            micro_completion_ids = [torch.tensor(ids, device=device) for ids in micro_completion_ids]
-            micro_completion_ids = pad(micro_completion_ids, padding_value=self.processing_class.pad_token_id)
+            completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
+            completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
             prompt_inputs_repeated = torch.repeat_interleave(prompt_inputs["input_ids"], self.num_generations, dim=0)
-            prompt_completion_ids = torch.cat([prompt_inputs_repeated, micro_completion_ids], dim=1)
+            prompt_completion_ids = torch.cat([prompt_inputs_repeated, completion_ids], dim=1)
         else:
             # Regular generation path
             with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
