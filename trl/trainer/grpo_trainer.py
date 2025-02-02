@@ -435,6 +435,7 @@ class GRPOTrainer(Trainer):
         micro_bsz = self.args.per_device_micro_batch_size or bsz  # default to full batch if not set
         prompt_length = prompt_inputs["input_ids"].size(1)
         prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]
+        prompt_attn_mask = prompt_inputs["attention_mask"].repeat_interleave(self.num_generations, dim=0)
 
         # Prepare reward kwargs before looping through microbatches
         if any(not isinstance(reward_func, PreTrainedModel) for reward_func in self.reward_funcs):
@@ -461,9 +462,11 @@ class GRPOTrainer(Trainer):
             current_bsz = micro_completion_ids.size(0)  # last one may be <micro_bsz
 
             # Get the per-token log probabilities for the completions for the model and the reference model
-            def get_per_token_logps(model, input_ids, logits_to_keep):
+            def get_per_token_logps(model, input_ids, attention_mask, logits_to_keep):
                 # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
-                logits = model(input_ids, logits_to_keep=logits_to_keep + 1).logits  # (B, L, V)
+                logits = model(
+                    input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1
+                ).logits  # (B, L, V)
                 logits = logits[
                     :, :-1, :
                 ]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
@@ -476,30 +479,34 @@ class GRPOTrainer(Trainer):
                     per_token_logps.append(token_log_prob)
                 return torch.stack(per_token_logps)
 
-            # we only need to compute the logits for the completion tokens
-            logits_to_keep = micro_completion_ids.size(1)
-            per_token_logps = get_per_token_logps(model, micro_prompt_completion_ids, logits_to_keep)
-
-            with torch.inference_mode():
-                if self.ref_model is not None:
-                    ref_per_token_logps = get_per_token_logps(
-                        self.ref_model, micro_prompt_completion_ids, logits_to_keep
-                    )
-                else:
-                    with self.accelerator.unwrap_model(model).disable_adapter():
-                        ref_per_token_logps = get_per_token_logps(model, micro_prompt_completion_ids, logits_to_keep)
-
-            # Compute the KL divergence between the model and the reference model
-            per_token_kl = (
-                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-            )
-
             # Mask everything after the first EOS token
             is_eos = micro_completion_ids == self.processing_class.eos_token_id
             eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
             eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
             sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
             completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+            attention_mask = torch.cat([prompt_attn_mask[current_batch_span], completion_mask], dim=1)
+
+            logp_kwargs = {
+                "input_ids": micro_prompt_completion_ids,
+                "attention_mask": attention_mask,
+                "logits_to_keep": micro_completion_ids.size(1),
+            }
+
+            # we only need to compute the logits for the completion tokens
+            per_token_logps = get_per_token_logps(model, **logp_kwargs)
+
+            with torch.inference_mode():
+                if self.ref_model is not None:
+                    ref_per_token_logps = get_per_token_logps(self.ref_model, **logp_kwargs)
+                else:
+                    with self.accelerator.unwrap_model(model).disable_adapter():
+                        ref_per_token_logps = get_per_token_logps(model, **logp_kwargs)
+
+            # Compute the KL divergence between the model and the reference model
+            per_token_kl = (
+                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            )
 
             # Decode the generated completions
             completions = self.processing_class.batch_decode(micro_completion_ids, skip_special_tokens=True)
