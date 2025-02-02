@@ -148,6 +148,7 @@ class GRPOTrainer(Trainer):
     """
 
     _tag_names = ["trl", "grpo"]
+    args: GRPOConfig  # helps with type hinting
 
     def __init__(
         self,
@@ -431,7 +432,7 @@ class GRPOTrainer(Trainer):
         logger.info("Finished generation")
 
         bsz = prompt_inputs["input_ids"].size(0)
-        loss_bsz = self.args.per_device_loss_batch_size or bsz
+        micro_bsz = self.args.per_device_micro_batch_size or bsz  # default to full batch if not set
         prompt_length = prompt_inputs["input_ids"].size(1)
         prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]
 
@@ -450,8 +451,8 @@ class GRPOTrainer(Trainer):
         all_rewards_per_func = []
         all_per_token_logps = []
         all_per_token_kl = []
-        for i in range(0, bsz, loss_bsz):
-            current_batch_span = slice(i, i + loss_bsz)
+        for i in range(0, bsz, micro_bsz):
+            current_batch_span = slice(i, i + micro_bsz)
 
             completion_ids = prompt_completion_ids[current_batch_span, prompt_length:]
             current_bsz = completion_ids.size(0)

@@ -175,7 +175,7 @@ class GRPOConfig(TrainingArguments):
         metadata={"help": "KL coefficient."},
     )
 
-    per_device_loss_batch_size: int = field(
+    per_device_micro_batch_size: int = field(
         default=8,
         metadata={
             "help": "Micro batch size per GPU/TPU/MPS/NPU core/CPU for computing loss terms. "
