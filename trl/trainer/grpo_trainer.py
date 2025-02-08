@@ -42,6 +42,7 @@ from transformers.utils import is_peft_available, logging
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from ..import_utils import is_vllm_available
 from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
+from .callbacks import SyncRefModelCallback
 from .grpo_config import GRPOConfig
 from .utils import generate_model_card, get_comet_experiment_url, pad
 
@@ -353,6 +354,9 @@ class GRPOTrainer(Trainer):
             else:
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
 
+        if args.sync_ref_model:
+            self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
+
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
@@ -386,7 +390,6 @@ class GRPOTrainer(Trainer):
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -self.max_prompt_length :]
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -self.max_prompt_length :]
 
-        logger.info("Starting generation")
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
             # First, have main process load weights if needed
@@ -428,7 +431,6 @@ class GRPOTrainer(Trainer):
                     **prompt_inputs, generation_config=self.generation_config
                 )
             model.train()
-        logger.info("Finishing generation")
 
         # Compute prompt length and extract completion ids
         prompt_length = prompt_inputs["input_ids"].size(1)
@@ -442,7 +444,9 @@ class GRPOTrainer(Trainer):
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
         # Concatenate prompt_mask with completion_mask for logit computation
-        prompt_mask_repeated = prompt_inputs["attention_mask"].to(device).repeat_interleave(self.num_generations, dim=0)
+        prompt_mask_repeated = (
+            prompt_inputs["attention_mask"].to(device).repeat_interleave(self.num_generations, dim=0)
+        )
         attention_mask = torch.cat([prompt_mask_repeated, completion_mask], dim=1)  # (B*G, P+C)
 
         # Get the per-token log probabilities for the completions for the model and the reference model
@@ -547,8 +551,6 @@ class GRPOTrainer(Trainer):
 
         mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
-
-        logger.info("Finishing loss")
 
         return loss
 
