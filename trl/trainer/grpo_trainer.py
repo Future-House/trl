@@ -16,6 +16,7 @@ import os
 import textwrap
 import warnings
 from collections import defaultdict
+from copy import deepcopy
 from typing import Any, Callable, Optional, Union
 from unittest.mock import patch
 
@@ -37,6 +38,7 @@ from transformers import (
     is_wandb_available,
 )
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from transformers.trainer_utils import EvalPrediction
 from transformers.utils import is_peft_available, logging
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
@@ -161,6 +163,7 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        compute_metrics: Callable[[EvalPrediction], dict[str, float]] | None = None,
     ):
         # Args
         if args is None:
@@ -278,6 +281,7 @@ class GRPOTrainer(Trainer):
             processing_class=processing_class,
             callbacks=callbacks,
             optimizers=optimizers,
+            compute_metrics=compute_metrics or self.compute_reward_metrics,
         )
 
         if self.use_vllm:
@@ -370,10 +374,9 @@ class GRPOTrainer(Trainer):
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         return inputs
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        if return_outputs:
-            raise ValueError("The GRPOTrainer does not support returning outputs")
-
+    def _generate(
+        self, model, inputs, generation_config: GenerationConfig | None = None
+    ) -> tuple[list[str], dict[str, Any], torch.Tensor]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
@@ -424,13 +427,73 @@ class GRPOTrainer(Trainer):
             with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
                 unwrapped_model.eval()  # Needed to make sure use_cache works with gradient_checkpointing
                 prompt_completion_ids = unwrapped_model.generate(
-                    **prompt_inputs, generation_config=self.generation_config
+                    **prompt_inputs, generation_config=(generation_config or self.generation_config)
                 )
             model.train()
 
+        return prompts, prompt_inputs, prompt_completion_ids
+
+    def _extract_completions(
+        self, inputs, prompt_inputs: dict[str, Any], prompt_completion_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, list[str]]:
         # Compute prompt length and extract completion ids
         prompt_length = prompt_inputs["input_ids"].size(1)
         completion_ids = prompt_completion_ids[:, prompt_length:]
+
+        # Decode the generated completions
+        completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        if is_conversational(inputs[0]):
+            completions = [[{"role": "assistant", "content": completion}] for completion in completions]
+
+        return completion_ids, completions
+
+    def _compute_rewards(
+        self, inputs, prompts: list[str], completions: list[str], num_generations: int | None = None
+    ) -> torch.Tensor:
+        device = self.accelerator.device
+
+        if num_generations is None:
+            num_generations = self.num_generations
+
+        # Compute the rewards
+        prompts = [prompt for prompt in prompts for _ in range(num_generations)]
+
+        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        for i, (reward_func, reward_processing_class) in enumerate(
+            zip(self.reward_funcs, self.reward_processing_classes)
+        ):
+            if isinstance(reward_func, PreTrainedModel):
+                if is_conversational(inputs[0]):
+                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                else:
+                    texts = [p + c for p, c in zip(prompts, completions)]
+                reward_inputs = reward_processing_class(
+                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                )
+                reward_inputs = super()._prepare_inputs(reward_inputs)
+                with torch.inference_mode():
+                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+            else:
+                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
+                for key in reward_kwargs:
+                    for example in inputs:
+                        # Repeat each value in the column for `num_generations` times
+                        reward_kwargs[key].extend([example[key]] * num_generations)
+                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        return rewards_per_func
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if return_outputs:
+            raise ValueError("The GRPOTrainer does not support returning outputs")
+
+        device = self.accelerator.device
+
+        prompts, prompt_inputs, prompt_completion_ids = self._generate(model, inputs)
+        completion_ids, completions = self._extract_completions(inputs, prompt_inputs, prompt_completion_ids)
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -478,39 +541,8 @@ class GRPOTrainer(Trainer):
         # Compute the KL divergence between the model and the reference model
         per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
 
-        # Decode the generated completions
-        completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        if is_conversational(inputs[0]):
-            completions = [[{"role": "assistant", "content": completion}] for completion in completions]
-
-        # Compute the rewards
-        prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]
-
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
-        for i, (reward_func, reward_processing_class) in enumerate(
-            zip(self.reward_funcs, self.reward_processing_classes)
-        ):
-            if isinstance(reward_func, PreTrainedModel):
-                if is_conversational(inputs[0]):
-                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
-                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
-                else:
-                    texts = [p + c for p, c in zip(prompts, completions)]
-                reward_inputs = reward_processing_class(
-                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                )
-                reward_inputs = super()._prepare_inputs(reward_inputs)
-                with torch.inference_mode():
-                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
-            else:
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
-                for key in reward_kwargs:
-                    for example in inputs:
-                        # Repeat each value in the column for `num_generations` times
-                        reward_kwargs[key].extend([example[key]] * self.num_generations)
-                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
-                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+        # Now deal with rewards and advantages
+        rewards_per_func = self._compute_rewards(inputs, prompts, completions)
 
         # Sum the rewards from all reward functions
         rewards = rewards_per_func.sum(dim=1)
@@ -550,12 +582,44 @@ class GRPOTrainer(Trainer):
 
         return loss
 
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
+    def prediction_step(
+        self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None
+    ) -> tuple[None, torch.Tensor, torch.Tensor]:
+        """Co-opting this method to record eval rewards.
+
+        Normally this is supposed to return (loss, logits, labels) [all optional], but we don't care
+        about any of those. Instead, we sample responses from the model, compute rewards, and return
+        the rewards in place of logits. NOTE: this only works if self.compute_metrics accepts
+        this output, e.g. by uisng self.compute_reward_metrics.
+        """
+        # we don't need multiple samples during eval
+        gen_config = deepcopy(self.generation_config)
+        gen_config.num_return_sequences = 1
+
         with torch.no_grad():
             with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs)
-            loss = loss.mean().detach()
-        return loss, None, None
+                # is this context manager necessary? unclear
+                prompts, prompt_inputs, prompt_completion_ids = self._generate(
+                    model, inputs, generation_config=gen_config
+                )
+                _, completions = self._extract_completions(inputs, prompt_inputs, prompt_completion_ids)
+                rewards_per_func = self._compute_rewards(inputs, prompts, completions, num_generations=1)
+
+        # self.compute_metrics won't be called unless both logits and labels are non-None, so we
+        # also return a dummy tensor in place of labels
+        return None, rewards_per_func, torch.tensor(0.0, device=self.accelerator.device)
+
+    def compute_reward_metrics(self, eval_prediction: EvalPrediction) -> dict[str, float]:
+        avg_reward_per_func = eval_prediction.predictions.mean(axis=0)
+        metrics: dict[str, float] = {}
+        for i, reward_func in enumerate(self.reward_funcs):
+            if isinstance(reward_func, PreTrainedModel):
+                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+            else:
+                reward_func_name = reward_func.__name__
+            metrics[f"rewards/{reward_func_name}"] = avg_reward_per_func[i].item()
+
+        return metrics
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics
