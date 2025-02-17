@@ -137,6 +137,12 @@ def setup_chat_format(
 
 def remove_hooks(model: "DeepSpeedEngine") -> None:
     """Removes the optimizer hooks from a DeepSpeed ZeRO-3 model."""
+    if not hasattr(model, "optimizer"):  # before the first training step, the model has no optimizer
+        # From https://github.com/huggingface/trl/pull/2776. NOTE: I don't think the above comment
+        # (from upstream) is correct, since we hit this even after the first training step (and I
+        # think upstream does too). I think the problem is calling code is trying to unwrap the base
+        # model, not the engine. TODO: understand this properly.
+        return
     if model.optimizer is not None and hasattr(model.optimizer, "parameter_offload"):
         optimizer_offload = model.optimizer.parameter_offload
     elif model.optimizer is not None:
@@ -164,6 +170,9 @@ def iter_params(module, recurse=False):
 
 def add_hooks(model: "DeepSpeedEngine") -> None:
     """Adds the optimizer hooks from a DeepSpeed ZeRO-3 model."""
+    if not hasattr(model, "optimizer"):  # before the first training step, the model has no optimizer
+        # From https://github.com/huggingface/trl/pull/2776
+        return
     if model.optimizer is not None and hasattr(model.optimizer, "parameter_offload"):
         optimizer_offload = model.optimizer.parameter_offload
     elif model.optimizer is not None:
