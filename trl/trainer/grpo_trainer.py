@@ -16,7 +16,7 @@ import os
 import textwrap
 import warnings
 from collections import defaultdict
-from typing import Any, Callable, Optional, Sized, Union
+from typing import Any, Callable, Dict, Optional, Sized, Union
 from unittest.mock import patch
 
 import torch
@@ -40,6 +40,7 @@ from transformers import (
     is_wandb_available,
 )
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
+from transformers.trainer_utils import EvalPrediction
 from transformers.utils import is_peft_available
 
 from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
@@ -262,6 +263,7 @@ class GRPOTrainer(Trainer):
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
+        compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None,
     ):
         # Args
         if args is None:
@@ -408,6 +410,7 @@ class GRPOTrainer(Trainer):
             processing_class=processing_class,
             callbacks=callbacks,
             optimizers=optimizers,
+            compute_metrics=compute_metrics or self.compute_reward_metrics,
         )
 
         # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
@@ -936,6 +939,17 @@ class GRPOTrainer(Trainer):
                 loss = self.compute_loss(model, inputs)
             loss = loss.mean().detach()
         return loss, None, None
+
+    def compute_reward_metrics(self, eval_prediction: EvalPrediction) -> dict[str, float]:
+        avg_reward_per_func = eval_prediction.predictions.mean(axis=0)
+        metrics: dict[str, float] = {}
+        for i, reward_func in enumerate(self.reward_funcs):
+            if isinstance(reward_func, PreTrainedModel):
+                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+            else:
+                reward_func_name = reward_func.__name__
+            metrics[f"rewards/{reward_func_name}"] = avg_reward_per_func[i].item()
+        return metrics
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "eval" if self.control.should_evaluate else "train"
