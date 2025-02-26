@@ -16,7 +16,8 @@ import os
 import textwrap
 import warnings
 from collections import defaultdict
-from typing import Any, Callable, Dict, Optional, Sized, Union
+from copy import deepcopy
+from typing import Any, Callable, Dict, Optional, Sized, Tuple, Union
 from unittest.mock import patch
 
 import torch
@@ -676,6 +677,77 @@ class GRPOTrainer(Trainer):
             inputs = self._generate_and_score_completions(inputs)
         return inputs
 
+    def _generate(
+        self, inputs: dict[str, Union[torch.Tensor, Any]], device, generation_config: GenerationConfig | None = None
+    ) -> tuple[dict[str, torch.Tensor], list[str], torch.Tensor]:
+        prompts = [x["prompt"] for x in inputs]
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        prompt_inputs = self.processing_class(
+            prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+        )
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+
+        if self.max_prompt_length is not None:
+            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
+            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+
+        # Generate completions using either vLLM or regular generation
+        if self.args.use_vllm:
+            if generation_config is not None:
+                raise NotImplementedError("Didn't yet implement a custom generation_config with vLLM.")
+            # First, have main process load weights if needed
+            if self.state.global_step != self._last_loaded_step:
+                self._move_model_to_vllm()
+                self._last_loaded_step = self.state.global_step
+
+            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            all_prompts_text = gather_object(prompts_text)
+            if self.accelerator.is_main_process:
+                # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+                # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                # prompt individually.
+                ordered_set_of_prompts = list(dict.fromkeys(all_prompts_text))
+                all_outputs = self.llm.generate(
+                    ordered_set_of_prompts, sampling_params=self.sampling_params, use_tqdm=False
+                )
+                completion_ids = []
+                for outputs in all_outputs:
+                    for output in outputs.outputs:
+                        completion_ids.append(output.token_ids)
+            else:
+                completion_ids = [None] * len(all_prompts_text)
+            # Broadcast the completions from the main process to all processes, ensuring each process receives its
+            # corresponding slice.
+            completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            process_slice = slice(
+                self.accelerator.process_index * len(prompts),
+                (self.accelerator.process_index + 1) * len(prompts),
+            )
+            completion_ids = completion_ids[process_slice]
+
+            # Pad the completions, and concatenate them with the prompts
+            completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
+            completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        else:
+            # Regular generation path
+            with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+                unwrapped_model.eval()  # Needed to make sure use_cache works with gradient_checkpointing
+                prompt_completion_ids = unwrapped_model.generate(
+                    prompt_ids,
+                    attention_mask=prompt_mask,
+                    generation_config=generation_config or self.generation_config,
+                )
+            self.model.train()
+
+            # Compute prompt length and extract completion ids
+            prompt_length = prompt_ids.size(1)
+            prompt_ids = prompt_completion_ids[:, :prompt_length]
+            completion_ids = prompt_completion_ids[:, prompt_length:]
+
+        return inputs, prompts, completion_ids
+
     def _extract_completions(
         self, inputs, prompts: list[str | dict[str, Any]], completion_ids: torch.Tensor
     ) -> tuple[list[str | dict[str, Any]], list[str]]:
@@ -945,13 +1017,32 @@ class GRPOTrainer(Trainer):
         self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
         return loss
 
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None):
-        inputs = self._prepare_inputs(inputs)
+    def prediction_step(
+        self, model, inputs, prediction_loss_only, ignore_keys: Optional[list[str]] = None
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Perform an evaluation step on `model` using `inputs`.
+
+        Normally this method performs an eval, but we co-opt it so eval rewards are recorded.
+        To do so, we sample responses from the model, compute rewards,
+        and return the rewards in place of logits.
+
+        NOTE: this only works if self.compute_metrics accepts this output,
+        e.g. by using self.compute_reward_metrics.
+        """
+        gen_config = deepcopy(self.generation_config)
+        gen_config.num_return_sequences = 1  # we don't need multiple samples during eval
+        device = self.accelerator.device
+
         with torch.no_grad():
-            with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs)
-            loss = loss.mean().detach()
-        return loss, None, None
+            with self.compute_loss_context_manager():  # is this compute_loss_context_manager necessary? unclear
+                inputs, prompts, completion_ids = self._generate(inputs, device, generation_config=gen_config)
+                completions, _ = self._extract_completions(inputs, prompts, completion_ids)
+                rewards_per_func = self._compute_rewards_per_func(inputs, prompts, completions, device=device)
+
+        # self.compute_metrics won't be called unless both logits and labels are non-None,
+        # so we also return a dummy labels tensor
+        return None, rewards_per_func, torch.tensor(0.0, device=device)
 
     def compute_reward_metrics(self, eval_prediction: EvalPrediction) -> dict[str, float]:
         avg_reward_per_func = eval_prediction.predictions.mean(axis=0)
