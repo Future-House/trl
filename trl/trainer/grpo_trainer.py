@@ -676,6 +676,20 @@ class GRPOTrainer(Trainer):
             inputs = self._generate_and_score_completions(inputs)
         return inputs
 
+    def _extract_completions(
+        self, inputs, prompts: list[str | dict[str, Any]], completion_ids: torch.Tensor
+    ) -> tuple[list[str | dict[str, Any]], list[str]]:
+        # Decode the generated completions
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        if is_conversational(inputs[0]):
+            completions = []
+            for prompt, completion in zip(prompts, completions_text):
+                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+                completions.append([{"role": "assistant", "content": bootstrap + completion}])
+        else:
+            completions = completions_text
+        return completions, completions_text
+
     def _compute_rewards_per_func(self, inputs, prompts: list[str], completions: list[str], device) -> torch.Tensor:
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
         for i, (reward_func, reward_processing_class) in enumerate(
@@ -804,15 +818,7 @@ class GRPOTrainer(Trainer):
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
 
-        # Decode the generated completions
-        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        if is_conversational(inputs[0]):
-            completions = []
-            for prompt, completion in zip(prompts, completions_text):
-                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
-                completions.append([{"role": "assistant", "content": bootstrap + completion}])
-        else:
-            completions = completions_text
+        completions, completions_text = self._extract_completions(inputs, prompts, completion_ids)
 
         rewards_per_func = self._compute_rewards_per_func(inputs, prompts, completions, device)
 
