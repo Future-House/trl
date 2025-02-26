@@ -719,7 +719,7 @@ class GRPOTrainer(Trainer):
         return gather(rewards_per_func)
 
     def _generate_and_score_completions(
-        self, inputs: dict[str, Union[torch.Tensor, Any]]
+        self, inputs: dict[str, Union[torch.Tensor, Any]], generation_config: GenerationConfig | None = None
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
@@ -736,6 +736,8 @@ class GRPOTrainer(Trainer):
 
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
+            if generation_config is not None:
+                raise NotImplementedError("Didn't yet implement a custom generation_config with vLLM.")
             # First, have main process load weights if needed
             if self.state.global_step != self._last_loaded_step:
                 self._move_model_to_vllm()
@@ -775,7 +777,9 @@ class GRPOTrainer(Trainer):
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
                 unwrapped_model.eval()  # Needed to make sure use_cache works with gradient_checkpointing
                 prompt_completion_ids = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                    prompt_ids,
+                    attention_mask=prompt_mask,
+                    generation_config=generation_config or self.generation_config,
                 )
             self.model.train()
 
