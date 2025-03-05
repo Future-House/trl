@@ -117,6 +117,7 @@ class GRPOConfig(TrainingArguments):
         default=256,
         metadata={"help": "Maximum length of the generated completion."},
     )
+    kl_clamp: Optional[float] = field(default=None)
 
     # Parameters that control generation acceleration powered by vLLM
     use_vllm: Optional[bool] = field(

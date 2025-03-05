@@ -540,6 +540,8 @@ class GRPOTrainer(Trainer):
 
         # Compute the KL divergence between the model and the reference model
         per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+        if self.args.kl_clamp is not None:
+            per_token_kl = torch.clamp(per_token_kl, max=self.args.kl_clamp, min=-self.args.kl_clamp)
 
         # Now deal with rewards and advantages
         rewards_per_func = self._compute_rewards(inputs, prompts, completions)
