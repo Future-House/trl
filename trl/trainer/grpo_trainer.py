@@ -353,28 +353,7 @@ class GRPOTrainer(Trainer):
         else:
             self.reward_weights = torch.ones(len(reward_funcs), dtype=torch.float32)
 
-        # Reward processing class
-        if reward_processing_classes is None:
-            reward_processing_classes = [None] * len(reward_funcs)
-        elif not isinstance(reward_processing_classes, list):
-            reward_processing_classes = [reward_processing_classes]
-        else:
-            if len(reward_processing_classes) != len(reward_funcs):
-                raise ValueError("The number of reward processing classes must match the number of reward functions.")
-
-        for i, (reward_processing_class, reward_func) in enumerate(
-            zip(reward_processing_classes, reward_funcs, strict=True)
-        ):
-            if isinstance(reward_func, PreTrainedModel):
-                if reward_processing_class is None:
-                    reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
-                if reward_processing_class.pad_token_id is None:
-                    reward_processing_class.pad_token = reward_processing_class.eos_token
-                # The reward model computes the reward for the latest non-padded token in the input sequence.
-                # So it's important to set the pad token ID to the padding token ID of the processing class.
-                reward_func.config.pad_token_id = reward_processing_class.pad_token_id
-                reward_processing_classes[i] = reward_processing_class
-        self.reward_processing_classes = reward_processing_classes
+        self.reward_processing_classes = self._make_reward_processing_classes(reward_funcs, reward_processing_classes)
 
         # Data collator
         def data_collator(features):  # No data collation is needed in GRPO
@@ -573,6 +552,33 @@ class GRPOTrainer(Trainer):
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
+
+    @staticmethod
+    def _make_reward_processing_classes(
+        reward_funcs,
+        reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
+    ):
+        if reward_processing_classes is None:
+            reward_processing_classes = [None] * len(reward_funcs)
+        elif not isinstance(reward_processing_classes, list):
+            reward_processing_classes = [reward_processing_classes]
+        else:
+            if len(reward_processing_classes) != len(reward_funcs):
+                raise ValueError("The number of reward processing classes must match the number of reward functions.")
+
+        for i, (reward_processing_class, reward_func) in enumerate(
+            zip(reward_processing_classes, reward_funcs, strict=True)
+        ):
+            if isinstance(reward_func, PreTrainedModel):
+                if reward_processing_class is None:
+                    reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
+                if reward_processing_class.pad_token_id is None:
+                    reward_processing_class.pad_token = reward_processing_class.eos_token
+                # The reward model computes the reward for the latest non-padded token in the input sequence.
+                # So it's important to set the pad token ID to the padding token ID of the processing class.
+                reward_func.config.pad_token_id = reward_processing_class.pad_token_id
+                reward_processing_classes[i] = reward_processing_class
+        return reward_processing_classes
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
